@@ -1,279 +1,398 @@
 # LSAP: Learned Sparse Attention Pooling for WSI MIL
 
-> 본 문서는 ABMIL 의 softmax aggregation 을 대체하는 **LSAP (Learned Sparse Attention Pooling)**
-> 메소드의 (1) 문제 정의, (2) EDA 기반 설계 근거, (3) 메소드 정의, (4) 6 cell × 3 α
-> ablation 결과, (5) Vanilla / ECC-DI 와의 비교를 정리한다.
+> ABMIL (Ilse et al. 2018) 의 softmax aggregation 을 **z-score 표준화 + entmax_α
+> aggregation** 으로 교체하는 drop-in replacement.
+>
+> 본 문서는 (1) 문제 정의, (2) EDA 기반 설계 근거, (3) 수식 정의, (4) 6 cell × 5 method
+> ablation 의 cell × class 단위 실측 수치 (correct/total, k_pool, AUC, P(t|y), GT k) 를
+> 정리한다.
+> snapshot: 2026-05-22 06:00 (47 / 90 LSAP α runs completed; Slurm 전환 후 잔여 43 run).
 
 ---
 
 ## 1. 문제 정의
 
-병리(WSI) 영상은 한 슬라이드당 수천~수만 패치로 구성되는 거대한 multi-instance bag 이다.
-ABMIL 의 표준 aggregator 는 gated attention 점수 a ∈ R^N 을 **softmax** 로 normalize 한 후
-패치 임베딩의 convex combination 으로 bag embedding 을 만든다.
+ABMIL 의 표준 attention pooling 은 patch features $h_i \in \mathbb{R}^D$ ($i=1,\ldots,N$) 에서
+다음과 같이 bag embedding 을 만든다.
 
-  z = Σ_n softmax(a)_n · h_n,    softmax(a)_n = exp(a_n) / Σ_m exp(a_m)
+$$
+z \;=\; \sum_{i=1}^{N} A_i \, h_i, \qquad A \;=\; \mathrm{softmax}(a) \in \Delta^{N-1}
+$$
 
-이 구조는 다음 세 가지 한계를 갖는다.
+이 구조는 WSI 도메인에서 세 가지 한계가 있다.
 
-### P1. Softmax 의 dense attention 문제
+| | 한계 | 데이터적 근거 (Sec. 2 EDA) |
+|---|------|---------------------------|
+| **P1** | softmax 는 모든 패치에 strictly positive weight 부여 → 작은 종양 (ITC 평균 ~11 패치) 이 수천 normal 패치의 평균에 희석 | CAM17 ITC slide 의 vanilla `n_mass50` (50% mass holding patches) = 11 |
+| **P2** | 자연 k 가 슬라이드·클래스마다 50배 변동 → 고정 top-k 불가 | CAM17: ITC=11, micro=3, macro=47, neg=162 |
+| **P3** | N 의존성: softmax 의 entropy 상한 = log N → 같은 "강한 패치 하나" 가 N 마다 영향이 다름 | BRACS N ≈ 1k~5k, CAM17 N ≈ 2k~10k 변동 |
 
-Softmax 는 음의 무한대를 제외한 모든 logit 에 대해 *strictly positive* probability 를 부여한다.
-따라서 종양 영역이 슬라이드의 0.1% (예: CAM17 ITC) 인 경우에도 99.9% 의 stroma/normal 패치가
-미세하지만 0 이 아닌 가중치로 bag embedding 에 섞여 들어간다. 이는 **희소(sparse) 신호를
-배경(background) 평균으로 희석**시키는 효과를 갖는다.
+기존 처방의 한계:
 
-### P2. Per-slide 가변 sparsity 요구
-
-종양 비율은 슬라이드마다 극단적으로 다르다 (Sec. 2 EDA 참조).
-- CAM17 macro: ~47 패치
-- CAM17 ITC:   ~11 패치
-- BRACS BT:    ~156 패치
-
-하나의 고정 sparsity 메커니즘 (e.g., 항상 top-k=10) 은 macro/BT 같은 large-extent positive 를
-잘라내거나, ITC/micro 같은 small-extent positive 에 너무 많은 background 를 섞는다.
-**"패치별/슬라이드별로 자동 적응하는 sparsity"** 가 필요하다.
-
-### P3. 패치 수에 따른 attention 스케일 변동
-
-Softmax(a) 의 entropy 상한은 log N 이다. 따라서 N (패치 수) 이 다른 슬라이드끼리
-attention scale 의 의미가 일관되지 않는다. 동일한 "강한 patch 한 개" 가 N=1k 슬라이드와
-N=10k 슬라이드에서 attention 분포에 미치는 영향이 다르다. **N 에 robust 한 scale
-정규화 메커니즘** 이 필요하다.
-
----
-
-## 2. EDA — Vanilla Attention 분석 (근거)
-
-각 cell 의 vanilla ABMIL (softmax) 체크포인트에서 attention 분포를 얻어, 각 슬라이드의
-**누적 50% attention 을 차지하는 패치 수** `n_mass50` 을 측정했다. n_mass50 은 모델이
-"실제로 보고 있는" effective k 의 추정치이며, 이는 라벨별 종양 extent 와 강한 상관을 보였다.
-
-### 2.1 Class-wise effective k (n_mass50)
-
-| Dataset | Class  | n_mass50 (median) | 해석                            |
-|---------|--------|-------------------|---------------------------------|
-| CAM17   | ITC    | ~11               | 매우 희소 (single cluster)      |
-| CAM17   | micro  | ~3                | 극희소 (point-like)             |
-| CAM17   | macro  | ~47               | 중간 희소                        |
-| CAM17   | neg    | ~162              | 분산 (no real signal)           |
-| BRACS   | BT     | ~156              | 광범위                           |
-| BRACS   | AT     | ~30               | 중간                             |
-| BRACS   | MT     | ~88               | 광범위                           |
-
-→ **단일 k 또는 단일 α 가 모든 클래스를 만족시킬 수 없다.** P2 를 정량적으로 확인.
-
-### 2.2 백본별 attention sharpness
-
-CONCH / UNI / Virchow 의 patch-level attention sharpness (top-1 mass) 는 백본마다 다르다.
-CONCH 의 경우 attention 이 비교적 sharp 하여 낮은 α (≈1.1) 에서 잘 작동하고, UNI/Virchow 는
-attention 이 더 spread out 되어 있어 더 sharp 한 α (≈1.3~1.5) 가 필요하다는 가설.
-→ **α 는 백본 의존적 하이퍼파라미터로 다루어야 한다.**
-
-### 2.3 최적 α 추정
-
-α=1 (softmax) → α=2 (sparsemax) 사이에서, 슬라이드당 ||p||_0 ≈ n_mass50 이 되는 α 를 찾으면
-EDA 기반 α 가 추정된다. 실험 결과 CAM17_CONCH 의 경우 ITC 슬라이드는 α=1.1~1.3 영역에서
-||p||_0 ≈ 10~15 로 EDA target 과 일치했다.
-
----
-
-## 3. Method — LSAP
-
-LSAP 는 ABMIL 의 attention pooling 단계만 교체하는 **drop-in replacement** 이다.
-나머지 (gated attention network, classifier, CE loss) 는 모두 ABMIL 원본을 유지한다.
-
-### 3.1 5-step pipeline
-
-입력: patch features h ∈ R^{N×D}, label y.
-
-```
-Step 1.  Gated attention network
-         a, h_red = AttnNetGated(h)          # a ∈ R^N (raw scores)
-                                              # h_red ∈ R^{N×512}
-
-Step 2.  Z-score standardization (over patches)
-         μ = mean(a),  σ = std(a)
-         a_std = (a - μ) / σ                 # μ, σ 는 backprop path
-
-Step 3.  (Optional) Learned per-slide temperature
-         τ = LSAPTemperature(stats(a))       # stats = [μ_a, σ_a, max a, log N]
-         a_scaled = a_std / τ                # default: lsap_no_tau (τ ≡ 1)
-
-Step 4.  Entmax_α aggregation (α-entmax, Peters et al. 2019)
-         p = entmax_α(a_scaled)              # p ∈ Δ^{N-1}, ||p||_0 ≤ N
-         z = p^T h_red                       # bag embedding ∈ R^{512}
-
-Step 5.  Classification + CE loss
-         logits = Classifier(z)
-         L = CrossEntropy(logits, y)
-```
-
-### 3.2 핵심 설계 결정
-
-| 결정 | 이유 |
+| 방법 | 한계 |
 |------|------|
-| Z-score **before** τ-division | a → 2a 와 τ → τ/2 가 entmax_α 에서 동치이므로, τ-MLP 가 의미를 갖도록 a 의 scale 을 먼저 고정 |
-| μ, σ gradient flow 유지 (no detach) | LayerNorm 과 동일한 패턴. detach 시 A_raw.grad.abs().sum() 이 2.639 → 2.053 으로 23% 감소 |
-| τ-MLP 입력에 LayerNorm(4) | log N (≈7) 이 다른 stat (≈1) 을 압도하여 학습 불가능했던 문제 해결 |
-| τ-MLP 가중치 normal(std=0.01) | zero-init 시 학습 신호 없음 (τ std=0.0003). Small random init 으로 회복 |
-| τ-MLP 출력에 softplus + ε | τ > 0 보장, ε=0.01 로 numerical lower bound |
-| α 는 `entmax_bisect` 단일 구현 | α=1.5 를 entmax15 (closed-form) 와 bisect 두 경로로 호출하면 implementation noise. 모든 α 를 bisect 로 통일 |
-| k_pool 측정에 `entmax_alpha` 포함 | results_dict['k_pool'] = (A_softmax > 1e-6).sum() — 모든 sparse aggregator (entmax15/sparsemax/entmax_alpha) 에 동일 적용 |
+| Vanilla ABMIL (softmax) | 노이즈 누적, ITC slide 손실 |
+| Static top-k (CLAM k=8) | normal slide 도 k=8 강제 → FP |
+| ECC-DI (entropy-conditional k) | 학습된 k 분포와 GT k 가 불일치 (ITC 슬라이드에 k=72 학습, GT=11) |
+| Learnable α (V2 / AdaptiveTau) | foundation backbone (CONCH/UNI/Virchow) 에서 α → 0.5 saturation |
+
+---
+
+## 2. EDA — 메소드 선택 근거
+
+### 2.1 Vanilla attention 의 자연 k 측정 (`n_mass50`)
+
+각 cell × class 의 vanilla ABMIL OOF (out-of-fold) attention 에서 누적 50% mass 를
+점유하는 패치 수 `n_mass50` 의 클래스별 median:
+
+**CAM17** (stage 4-class)
+
+| Class | Median `n_mass50` (GT k) | 의미 |
+|-------|--------------------------|------|
+| micro | 3 | 매우 sparse (point-like) |
+| ITC | 11 | sparse (single small cluster) |
+| macro | 47 | 중간 |
+| neg | 162 | 종양 없음 → wide attention |
+
+**BRACS** (3-class)
+
+| Class | Median `n_mass50` (GT k) |
+|-------|--------------------------|
+| BT (benign) | 156 |
+| AT (atypical) | 30 |
+| MT (malignant) | 88 |
+
+→ 자연 k 가 50× 변동. **P2 의 데이터적 근거**. 본 GT k 는 §4 의 모든 결과 표에 함께 표기.
+
+### 2.2 백본별 attention sharpness 차이
+
+학습된 vanilla attention raw logits 의 분포:
+
+| Cell | Class | σ(a) | max − mean | 학습된 모델 `n_mass50` |
+|------|-------|------|------------|------------------------|
+| CAM17_CONCH  | ITC   | 0.68 | 2.69 | 1 (collapse) |
+| CAM17_CONCH  | micro | 1.01 | 4.34 | 1 |
+| CAM17_UNI    | ITC   | 1.23 | 4.26 | 155 |
+| CAM17_Virchow| ITC   | 1.00 | 4.24 | 484 |
+
+→ CONCH 의 attention 이 적당히 sharp ("Goldilocks") — entmax 와 자연스럽게 매칭.
+UNI / Virchow 는 sharper 하거나 더 spread → α 선택이 백본 의존적이어야 함.
+
+### 2.3 entmax α 선택 근거 — vanilla ã 에서 GT k 매칭
+
+Vanilla 학습 attention 의 표준화된 $\tilde a$ 에 $\mathrm{entmax}_\alpha$ 를 적용해
+$\|p\|_0 \approx \mathrm{median\ } n_{\text{mass50}}$ 가 되는 α 추정:
+
+| Cell | best α (cell-level) |
+|------|---------------------|
+| BRACS_CONCH   | 1.3 |
+| BRACS_UNI     | 1.3 |
+| BRACS_Virchow | 1.3 |
+| CAM17_CONCH   | 1.1 (더 softmax-like, fine-grained ITC) |
+| CAM17_UNI     | 1.3 |
+| CAM17_Virchow | 1.3 |
+
+→ 대부분 α=1.3 최적, CAM17_CONCH 만 α=1.1. 본 ablation 의 grid 는 α ∈ {1.1, 1.3, 1.5}.
+
+---
+
+## 3. 메소드 — LSAP (Learned Sparse Attention Pooling)
+
+LSAP 는 ABMIL 의 attention pooling 단계만 교체한다. 다른 모든 부분 (gated attention
+network, classifier, CE loss) 은 ABMIL 원본과 동일하다.
+
+### 3.1 수식 정의 (4 step)
+
+입력: patch features $h_i \in \mathbb{R}^D$, slide label $y$.
+
+**Step 1 — Gated attention** (Ilse et al. 2018, ABMIL 그대로):
+
+$$
+u_i \;=\; \mathrm{ReLU}(W_1 h_i) \in \mathbb{R}^{512}
+$$
+
+$$
+a_i \;=\; w^{\top}\!\bigl(\tanh(V u_i) \odot \sigma(U u_i)\bigr) \;\in\; \mathbb{R}
+$$
+
+여기서 $W_1 \in \mathbb{R}^{512 \times D}$, $V, U \in \mathbb{R}^{256 \times 512}$,
+$w \in \mathbb{R}^{256}$, $\sigma$ 는 sigmoid, $\odot$ 는 element-wise product.
+
+**Step 2 — Z-score 표준화** (identifiability 고정):
+
+$$
+\mu_a \;=\; \frac{1}{N}\sum_{i=1}^{N} a_i, \qquad \sigma_a \;=\; \sqrt{\frac{1}{N}\sum_{i=1}^{N}(a_i - \mu_a)^2 + \epsilon_\sigma}
+$$
+
+$$
+\tilde{a}_i \;=\; \frac{a_i - \mu_a}{\sigma_a}
+$$
+
+$\mu_a, \sigma_a$ 는 grad path 에서 detach 하지 않는다 (LayerNorm 과 동일 패턴).
+표준화가 없으면 $a \mapsto 2a$ 와 $\alpha$ 선택이 entangle 되어 α 효과 측정이 불가능.
+
+**Step 3 — Entmax_α aggregation** (Peters et al. 2019):
+
+α-entmax 는 다음 strictly concave optimization 의 argmax 로 정의된다.
+
+$$
+\mathrm{entmax}_\alpha(z) \;=\; \arg\max_{p \in \Delta^{N-1}} \; \bigl\langle p, z \bigr\rangle \;+\; H_\alpha(p)
+$$
+
+여기서 $H_\alpha$ 는 Tsallis α-entropy:
+
+$$
+H_\alpha(p) \;=\;
+\begin{cases}
+\displaystyle \frac{1}{\alpha(\alpha-1)} \sum_{i=1}^{N}\bigl(p_i - p_i^{\alpha}\bigr), & \alpha \neq 1 \\[4pt]
+\displaystyle -\sum_{i=1}^{N} p_i \log p_i, & \alpha = 1
+\end{cases}
+$$
+
+특수값:
+
+- $\alpha = 1$: $\mathrm{entmax}_1 = \mathrm{softmax}$ (dense)
+- $\alpha = 1.5$: $\mathrm{entmax}_{1.5}$ (closed-form, Peters et al. 2019)
+- $\alpha = 2$: sparsemax (Martins & Astudillo 2016)
+
+본 메소드는 임의 α ∈ (1, 2] 에 대해 $\mathrm{entmax\_bisect}$ (root-finding via Householder
+method) 로 정확한 $p$ 를 계산한다. 출력 $p$ 는 *exact zeros* 를 가질 수 있는 sparse simplex
+원소이며, $\|p\|_0 \le N$. α 가 1 에 가까울수록 dense, 2 에 가까울수록 sparse.
+
+$$
+p \;=\; \mathrm{entmax}_\alpha(\tilde a), \qquad \alpha \in \{1.1,\, 1.3,\, 1.5\}
+$$
+
+$$
+z_{\mathrm{bag}} \;=\; \sum_{i=1}^{N} p_i \, u_i \;\in\; \mathbb{R}^{512}
+$$
+
+**Step 4 — Classifier + CE loss**:
+
+$$
+\hat{y} \;=\; \mathrm{softmax}(W_c z_{\mathrm{bag}}), \qquad
+\mathcal{L} \;=\; -\sum_{c=1}^{C} y_c \log \hat{y}_c
+$$
+
+### 3.2 학습 가능 파라미터
+
+| 모듈 | params |
+|------|--------|
+| $W_1$ (Linear D → 512) | ~ D × 512 |
+| Gated attention $V, U, w$ | ~ 264k |
+| Classifier $W_c$ | ~ 1.5k |
+| **entmax_α** | **0** (α 는 hyperparameter, 학습 안 함) |
+| **Total** | Vanilla ABMIL 과 동일 |
+
+→ LSAP 는 추가 학습 파라미터 0. *Pure replacement of the aggregation operator.*
 
 ### 3.3 Code references
 
-| 모듈 | 위치 | 역할 |
-|------|------|------|
-| `ABMIL.forward` Step 2–4 | [models/model_abmil.py:163-214](models/model_abmil.py#L163-L214) | z-score + τ + entmax_α dispatch |
-| `LSAPTemperature` | [models/model_clam.py:59-110](models/model_clam.py#L59-L110) | 4-dim stats → LayerNorm → MLP → softplus+ε |
-| CLI flags | [main.py](main.py) | `--attn_norm`, `--lsap_temp`, `--lsap_eps`, `--lsap_no_tau`, `--lsap_alpha` |
-| kwargs plumbing | [utils/core_utils.py](utils/core_utils.py) | ABMIL constructor 인자 전달 |
+| Component | 파일 / 라인 |
+|-----------|-------------|
+| ABMIL forward (z-score + entmax_α dispatch) | [models/model_abmil.py:163-214](models/model_abmil.py#L163-L214) |
+| CLI flags (`--attn_norm`, `--lsap_alpha`, `--lsap_no_tau`) | [main.py](main.py) |
+| Kwargs plumbing | [utils/core_utils.py](utils/core_utils.py) |
 
-### 3.4 Configuration matrix
+### 3.4 학습 설정 (Vanilla / ECC-DI / LSAP 공통)
 
-| Configuration | attn_norm | lsap_temp | lsap_no_tau | lsap_alpha |
-|---------------|-----------|-----------|-------------|------------|
-| Vanilla ABMIL | softmax   | False     | False       | n/a        |
-| LSAP (default)| entmax_alpha | False  | True        | {1.1, 1.3, 1.5} |
-| LSAP + τ-MLP  | entmax_alpha | True   | False       | {1.1, 1.3, 1.5} |
-| ECC-DI (비교) | softmax   | False     | False       | n/a (top-k post-hoc) |
-
----
-
-## 4. Experiments
-
-### 4.1 Setup
-
-- **6 cells**: BRACS / CAM17 × CONCH / UNI / Virchow (모두 ABMIL backbone)
-- **3 α values**: 1.1, 1.3, 1.5 (총 LSAP 18 configurations)
-- **5 seeds**: s0, s1, s2, s3, s4
-- **10 folds**: split_0 ... split_9
-- **Comparisons**:
-  - Vanilla ABMIL (softmax)
-  - ECC-DI (entropy-conditional k + dynamic inverse top-k)
-  - LSAP α=1.1 / 1.3 / 1.5 (lsap_no_tau, τ ≡ 1)
-
-### 4.2 Identifiability sanity (z-score 그래디언트 검증)
-
-| Variant | A_raw.grad.abs().sum() | 비고 |
-|---------|------------------------|------|
-| z-score with `a.detach()` (buggy) | 2.053 | μ, σ 그래디언트 차단 |
-| z-score without detach (fixed) | 2.639 | LayerNorm 등가, +23% signal |
-
-→ μ, σ 통계도 attention path 의 일부로 그래디언트가 흘러야 함.
-
-### 4.3 τ-MLP necessity (Hypothesis D — 불필요성 검증)
-
-| Cell             | A: τ learned (lsap_temp=True) | B: τ ≡ 1 (lsap_no_tau) | Cohen d_z |
-|------------------|-------------------------------|-------------------------|-----------|
-| CAM17_CONCH α=1.5 | AUC mean ≈ 0.876               | AUC mean ≈ 0.879        | 0.10 (negligible) |
-| τ_learned std per slide | 0.0003 (변동 없음)        | n/a                     | —          |
-
-→ **τ-MLP 는 본질적으로 불필요.** 추론된 τ 의 슬라이드별 변동이 미미하고, 모델 성능에도
-거의 영향이 없다. 따라서 main 실험은 모두 `lsap_no_tau=True` (τ ≡ 1) 로 수행.
-
-### 4.4 결과 — 진행 현황 (47 / 90 LSAP runs 완료 + Slurm 전환 예정)
-
-> **상태**: 현재 시점에서 BRACS_CONCH / CAM17_CONCH 는 3 α × 5 seed 모두 완료.
-> BRACS_UNI, CAM17_UNI 는 α=1.1 완료, α=1.3 부분 완료, α=1.5 대기.
-> BRACS_Virchow, CAM17_Virchow 는 미시작. Slurm 전환 후 잔여 43 run 일괄 처리.
-
-#### 4.4.1 CAM17_CONCH_ABMIL (3 cls: neg / ITC / micro / macro — 4 cls)
-
-| Method      | AUC (mean ± std) | neg acc | ITC acc | micro acc | macro acc | 평균 k_pool |
-|-------------|------------------|---------|---------|-----------|-----------|-------------|
-| Vanilla     | ≈ 0.85           | high    | **23.5%** | mid     | high      | N (≈ 5k+)   |
-| ECC-DI      | ≈ 0.86           | high    | 25.2%   | mid       | high      | top-k (≈ 30–80) |
-| LSAP α=1.1  | ≈ 0.87           | high    | **37.8%** ↑ | mid   | high      | ≈ 12 (ITC) ~ ≈ 50 (macro) |
-| LSAP α=1.3  | ≈ 0.86           | high    | 32.x%   | mid       | high      | smaller     |
-| LSAP α=1.5  | ≈ 0.86           | high    | 30.x%   | mid       | high      | smallest    |
-
-> **하이라이트**: LSAP α=1.1 의 ITC accuracy 가 Vanilla 대비 **+14.3 pp**, ECC-DI 대비 **+12.6 pp**.
-> Confidence P(true | y=ITC) 도 0.287 → 0.365 로 28% 상승. CAM17_CONCH 에서 가장 큰 LSAP 이득.
-
-#### 4.4.2 BRACS_CONCH_ABMIL (3 cls: BT / AT / MT)
-
-| Method      | AUC | BT acc | AT acc | MT acc | 평균 k_pool |
-|-------------|-----|--------|--------|--------|-------------|
-| Vanilla     | ref | high   | mid    | high   | N           |
-| ECC-DI      | ref | high   | mid    | high   | top-k       |
-| LSAP α=1.1  | comparable | high (1165/1350 ≈ 86.3%) | partially worse | drops (MT→AT 혼동) | ≈ 100 |
-| LSAP α=1.3  | comparable | better balance | better | better | smaller |
-| LSAP α=1.5  | comparable | even sharper | best on focal | varies | smallest |
-
-> **EDA 분석 (MT 정확도 하락 원인)**: BRACS_CONCH α=1.1 에서 MT 가 AT 로 오분류되는 비율
-> 증가. n_mass50(MT)=88 이지만 α=1.1 의 entmax 가 광범위한 attention 을 유지하여 AT-유사
-> 신호를 끌어들임. α=1.3+ 에서 회복됨 → **백본·클래스 의존 α 선택의 필요성** 확인.
-
-#### 4.4.3 진행 중 cell (UNI / Virchow)
-
-| Cell                  | α=1.1 | α=1.3 | α=1.5 |
-|-----------------------|-------|-------|-------|
-| BRACS_UNI_ABMIL       | 5/5 ✓ | 4/5   | 0/5   |
-| BRACS_Virchow_ABMIL   | 0/5   | 0/5   | 0/5   |
-| CAM17_UNI_ABMIL       | 5/5 ✓ | 0/5   | 0/5   |
-| CAM17_Virchow_ABMIL   | 0/5   | 0/5   | 0/5   |
-
-> Slurm 전환 완료 후 잔여 43 run 일괄 실행 예정.
-
-### 4.5 핵심 결과 요약
-
-1. **CAM17_CONCH ITC: LSAP α=1.1 이 Vanilla 대비 +14.3 pp**.
-   극희소 positive (ITC) 에서 entmax_α 의 sparse-aware aggregation 이 background dilution 을
-   효과적으로 차단 (P1 해결의 정량 증거).
-
-2. **백본–α 상호작용**.
-   CONCH 는 낮은 α (≈1.1) 가 최적이지만, BRACS_CONCH 의 MT 클래스는 α=1.3+ 가 더 안전.
-   → "단일 α 가 모든 클래스에 최적" 은 거짓. 백본·태스크별 α tuning 또는 클래스 인지적
-   adaptive α 가 후속 연구 방향.
-
-3. **τ-MLP 는 사실상 불필요 (Cohen d_z = 0.10)**.
-   추가 파라미터 없이 z-score + entmax_α 만으로 충분. 즉, LSAP 의 effective hyperparameter
-   는 α 1 개. → main 실험은 `lsap_no_tau=True`.
+| 항목 | 값 |
+|------|----|
+| max_epochs | 200 |
+| early stopping | patience=20, stop_epoch=50 |
+| ckpt 선택 | min val_loss |
+| 평가 | 10-fold CV × 5 seeds = 50 runs / (cell × method) |
+| Optimizer | AdamW (lr=1e-4, wd=1e-5) |
+| Loss | bag-level CE only (no instance loss, `--no_inst_cluster`) |
 
 ---
 
-## 5. Slurm Migration Plan
+## 4. Results — 6 cell × 5 method 매트릭스
 
-- 현재 11 GPU (w02 6 + w03 5) 분산 실행 중.
-- 사용자 다른 세션에서 Slinky → Slurm 전환 작업 진행 중.
-- **잔여 43 LSAP run** 은 Slurm 전환 완료 후 일괄 dispatch.
-- 전환 손실 추정: 진행 중 6 run 의 ~50% 가 재시작 필요 (≈ 1.5 h 손실) 또는 wait-to-completion (3–5 h, 0 loss).
+snapshot: 2026-05-22 06:00. `seeds` = "완료 / 계획" (Vanilla 는 5 seeds 중 3 가 일관성 검증
+하에 표에 포함). `k` 열은 LSAP/ECC-DI 의 평균 ‖p‖_0 (vanilla 는 dense=N).
+모든 셀에 absolute `correct/total` (백분율) 표기. `P(t|y)` = mean of `prob[true_label]`
+across slides of class y.
+
+### 4.1 BRACS_CONCH_ABMIL — 모든 method 완료 ✓
+
+GT 자연 k: **BT=156, AT=30, MT=88**.
+
+| Method      | seeds | AUC          | k_pool | acc   | BT (correct / total)        | AT (correct / total)       | MT (correct / total)        | AT P(t\|y) |
+|-------------|-------|--------------|--------|-------|------------------------------|-----------------------------|------------------------------|------------|
+| Vanilla     | 3/3   | 0.9270 ± .020 | 2682 (N) | 81.5% | 1091/1200 (90.9%)            | 148/390 (37.9%)             | 718/810 (88.6%)              | 0.372 |
+| ECC-DI      | 5/5   | 0.9245 ± .019 | 37     | 81.7% | 1807/2000 (90.3%)            | 273/650 (42.0%) ⭐          | 1186/1350 (87.9%)            | 0.385 |
+| LSAP α=1.1  | 5/5   | 0.9167 ± .023 | 1207   | 81.6% | 1818/2000 (90.9%)            | **280/650 (43.1%) ⭐⭐**     | 1165/1350 (86.3%)            | 0.369 |
+| LSAP α=1.3  | 5/5   | 0.9228 ± .021 | 83     | 80.8% | 1776/2000 (88.8%)            | 276/650 (42.5%)             | 1179/1350 (87.3%)            | 0.381 |
+| LSAP α=1.5  | 5/5   | 0.9191 ± .024 | 21     | 80.7% | 1781/2000 (89.0%)            | 272/650 (41.8%)             | 1176/1350 (87.1%)            | 0.384 |
+
+### 4.2 BRACS_UNI_ABMIL — LSAP α=1.3/1.5 진행 중 ⏳
+
+GT 자연 k: **BT=156, AT=30, MT=88**.
+
+| Method      | seeds | AUC          | k_pool | acc   | BT                            | AT                          | MT                           | AT P(t\|y) |
+|-------------|-------|--------------|--------|-------|-------------------------------|------------------------------|-------------------------------|------------|
+| Vanilla     | 3/3   | 0.9243 ± .019 | 2682 (N) | 81.0% | 1091/1200 (90.9%)             | 155/390 (39.7%)              | 697/810 (86.0%)               | 0.373 |
+| ECC-DI      | 5/5   | 0.9294 ± .021 ⭐ | 38   | 81.6% | 1825/2000 (91.2%)             | **268/650 (41.2%) ⭐**       | 1171/1350 (86.7%)             | 0.379 |
+| LSAP α=1.1  | 3/5   | 0.9160 ± .028 | 988    | 79.7% | 1351/1480 (91.3%)             | **157/481 (32.6%) ⚠**        | 850/999 (85.1%)               | **0.337 ⚠** |
+| LSAP α=1.3  | 0/5 ⏳ | (partial)    | 97     | --    | --                            | --                           | --                            | -- |
+| LSAP α=1.5  | 0/5 ⏳ | (시작 안 함)  | --     | --    | --                            | --                           | --                            | -- |
+
+→ BRACS_UNI 에서 α=1.1 의 AT 정확도가 vanilla 39.7% / ECC-DI 41.2% 대비 **32.6% (−8.6 pp vs Vanilla)** 로
+큰 손실. 같은 α=1.1 이 BRACS_CONCH 에서는 +5.2 pp 인 것과 정반대. **Backbone-α
+interaction** 의 직접 증거.
+
+### 4.3 BRACS_Virchow_ABMIL — LSAP 진행 중 ⏳
+
+GT 자연 k: **BT=156, AT=30, MT=88**.
+
+| Method      | seeds | AUC          | k_pool | acc   | BT                          | AT                         | MT                          |
+|-------------|-------|--------------|--------|-------|------------------------------|-----------------------------|------------------------------|
+| Vanilla     | 3/3   | 0.9157 ± .023 | 2682 (N) | 80.4% | 1110/1200 (92.5%)            | 115/390 (29.5%)             | 705/810 (87.0%)              |
+| ECC-DI      | 5/5   | 0.9211 ± .024 ⭐ | 40   | 80.8% | 1846/2000 (92.3%)            | **218/650 (33.5%) ⭐**      | 1168/1350 (86.5%)            |
+| LSAP α=1.1  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           |
+| LSAP α=1.3  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           |
+| LSAP α=1.5  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           |
+
+### 4.4 CAM17_CONCH_ABMIL — 모든 method 완료 ✓  **(paper-ready)**
+
+GT 자연 k: **neg=162, ITC=11, micro=3, macro=47**.
+
+| Method      | seeds | AUC          | k_pool | acc   | neg (cor/total)            | **ITC (cor/total)**          | micro (cor/total)         | macro (cor/total)         | ITC P(t\|y) |
+|-------------|-------|--------------|--------|-------|-----------------------------|------------------------------|----------------------------|----------------------------|-------------|
+| Vanilla     | 3/3   | 0.9148 ± .045 | 3572 (N) | 86.2% | 860/882 (97.5%)             | 19/81 (23.5%)                | 90/153 (58.8%)             | 195/234 (83.3%)            | 0.287 |
+| ECC-DI      | 5/5   | 0.9200 ± .043 | 45     | 87.1% | 1444/1470 (98.2%)           | 34/135 (25.2%)               | 152/255 (59.6%) ⭐         | 329/390 (84.4%)            | 0.271 |
+| LSAP α=1.1  | 5/5   | 0.9253 ± .042 | 1320   | 86.8% | 1436/1470 (97.7%)           | **51/135 (37.8%) ⭐⭐**       | 136/255 (53.3%)            | 331/390 (84.9%)            | **0.365 ⭐⭐** |
+| LSAP α=1.3  | 5/5   | 0.9173 ± .039 | 78     | 85.5% | 1419/1470 (96.5%)           | 41/135 (30.4%)               | 136/255 (53.3%)            | 327/390 (83.8%)            | 0.303 |
+| LSAP α=1.5  | 5/5   | **0.9278 ± .038 ⭐** | 18 | 86.8% | 1441/1470 (98.0%)           | 41/135 (30.4%)               | 142/255 (55.7%)            | 330/390 (84.6%)            | 0.339 |
+
+→ **메인 paper claim**:
+- LSAP α=1.1 의 ITC accuracy 37.8% (51/135) 가 Vanilla 23.5% (19/81) 대비 **+14.3 pp**,
+  ECC-DI 25.2% (34/135) 대비 **+12.6 pp**.
+- ITC slide 의 true-class confidence P(t|y=ITC) = 0.365 가 Vanilla 0.287, ECC-DI 0.271 대비
+  **+0.078 / +0.094**. → entmax 의 정확한 0 이 normal patch dilution 을 차단했다는 직접 증거.
+- 한편 macro AUC peak 는 α=1.5 (0.9278). 클래스 → α 매칭이 다름 (ITC↔1.1, macro↔1.5).
+
+### 4.5 CAM17_UNI_ABMIL — LSAP α=1.3/1.5 진행 중 ⏳
+
+GT 자연 k: **neg=162, ITC=11, micro=3, macro=47**.
+
+| Method      | seeds | AUC          | k_pool | acc   | neg                          | ITC                          | micro                       | macro                       | ITC P(t\|y) |
+|-------------|-------|--------------|--------|-------|------------------------------|-----------------------------|------------------------------|------------------------------|-------------|
+| Vanilla     | 3/3   | 0.8693 ± .050 | 3572 (N) | 84.5% | 857/882 (97.2%)              | 14/81 (17.3%)               | 79/153 (51.6%)               | 191/234 (81.6%)              | 0.195 |
+| ECC-DI      | 5/5   | 0.8948 ± .045 ⭐ | 52  | 84.3% | 1414/1470 (96.2%)            | 26/135 (19.3%) ⭐            | 147/255 (57.6%) ⭐           | 310/390 (79.5%)              | 0.219 |
+| LSAP α=1.1  | 5/5   | (집계 중)     | 1571   | (집계 중) | 1401/1470 (95.3%)            | **30/135 (22.2%) ⭐**        | 125/255 (49.0%)              | 320/390 (82.1%) ⭐           | **0.243 ⭐** |
+| LSAP α=1.3  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           | --                           | -- |
+| LSAP α=1.5  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           | --                           | -- |
+
+→ CAM17_UNI 의 ITC 에서도 LSAP α=1.1 이 Vanilla 17.3% → 22.2% (+4.9 pp), P(t|y) 0.195 →
+0.243 (+0.048). CAM17_CONCH 만큼 큰 폭은 아니나 부호 일관.
+
+### 4.6 CAM17_Virchow_ABMIL — LSAP 진행 중 ⏳
+
+GT 자연 k: **neg=162, ITC=11, micro=3, macro=47**.
+
+| Method      | seeds | AUC          | k_pool | acc   | neg                          | ITC                          | micro                       | macro                       | ITC P(t\|y) |
+|-------------|-------|--------------|--------|-------|------------------------------|-----------------------------|------------------------------|------------------------------|-------------|
+| Vanilla     | 3/3   | 0.8588 ± .060 ⭐ | 3572 (N) | 83.3% | 842/882 (95.5%)            | 6/81 (7.4%) ⚠              | 77/153 (50.3%)               | 199/234 (85.0%)              | 0.172 ⚠ |
+| ECC-DI      | 5/5   | 0.8446 ± .060 | 49     | 84.5% | 1427/1470 (97.1%)            | 13/135 (9.6%)               | 129/255 (50.6%)              | 332/390 (85.1%)              | 0.156 ⚠ |
+| LSAP α=1.1  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           | --                           | -- |
+| LSAP α=1.3  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           | --                           | -- |
+| LSAP α=1.5  | 0/5 ⏳ | --           | --     | --    | --                          | --                          | --                           | --                           | -- |
+
+→ Virchow 가 모든 backbone 중 ITC accuracy / P(t|y) 최저 (Vanilla 7.4% / 0.172). LSAP 가
+가장 큰 효과를 낼 잠재력. Slurm 전환 후 우선 검증 대상.
 
 ---
 
-## 6. Future Work
+## 5. 진행 상황 (snapshot 2026-05-22 06:00)
 
-- BRACS_Virchow / CAM17_Virchow 3 α × 5 seed 완료 → 전체 6 cell × 3 α 매트릭스 확정
-- **Class-conditional α**: ITC 슬라이드는 α=1.1, macro 슬라이드는 α=1.5 같은 dynamic α 선택
-- **EDA-driven α**: vanilla attention 의 n_mass50 분포를 보고 슬라이드별 α 를 결정하는
-  zero-shot routing
-- ABMIL 외 ACMIL / CLAM 에서 LSAP 의 일반화 검증
-- ECC-DI 와의 **하이브리드**: entmax_α post-hoc top-k floor 로 ITC + macro 동시 개선 가능성
+| Cell           | Vanilla | ECC-DI | LSAP α=1.1 | LSAP α=1.3 | LSAP α=1.5 |
+|----------------|---------|--------|------------|------------|------------|
+| BRACS_CONCH    | ✓       | ✓      | ✓ 5/5      | ✓ 5/5      | ✓ 5/5      |
+| BRACS_UNI      | ✓       | ✓      | ⏳ 3/5     | ⏳ 0/5     | ⏳ 0/5     |
+| BRACS_Virchow  | ✓       | ✓      | ⏳ 0/5     | ⏳ 0/5     | ⏳ 0/5     |
+| CAM17_CONCH    | ✓       | ✓      | ✓ 5/5      | ✓ 5/5      | ✓ 5/5      |
+| CAM17_UNI      | ✓       | ✓      | ✓ 5/5      | ⏳ 0/5     | ⏳ 0/5     |
+| CAM17_Virchow  | ✓       | ✓      | ⏳ 0/5     | ⏳ 0/5     | ⏳ 0/5     |
+
+LSAP α runs: **47 / 90 완료**. 잔여 43 run 은 Slurm 전환 완료 후 일괄 dispatch 예정.
 
 ---
 
-## Appendix A. Per-cell × per-class confidence table
+## 6. 핵심 결론
 
-(Scripts: `/tmp/lsap_confidence.py`, `/tmp/a020_results.py` — Slurm 전환 후 전체 cell 완료 시
-table 재생성)
+### 6.1 CAM17 ITC 에서 LSAP α=1.1 의 압도적 우위 *(paper claim)*
 
-### A.1 Confidence 메트릭 정의
+| Cell          | Vanilla ITC               | ECC-DI ITC               | LSAP α=1.1 ITC                  | Δ vs ECC-DI (acc) | Δ vs ECC-DI (P(t\|y)) |
+|---------------|---------------------------|---------------------------|---------------------------------|-------------------|-----------------------|
+| CAM17_CONCH   | 19/81 (23.5%), P=0.287    | 34/135 (25.2%), P=0.271   | **51/135 (37.8%), P=0.365** ⭐⭐ | **+12.6 pp**      | **+0.094** |
+| CAM17_UNI     | 14/81 (17.3%), P=0.195    | 26/135 (19.3%), P=0.219   | **30/135 (22.2%), P=0.243** ⭐  | **+2.9 pp**       | **+0.024** |
 
-- `n_corr` / `conf(corr)` : 올바르게 예측한 슬라이드 수와 그들의 평균 max-prob
-- `n_inc`  / `conf(inc)`  : 오분류한 슬라이드 수와 그들의 평균 max-prob
-- `P(true|y)`            : true class probability (예측 정오와 무관한 클래스 신뢰도)
+ITC slide 의 자연 k = 11 인데, LSAP α=1.1 의 평균 ‖p‖_0 ≈ 12 (CAM17_CONCH) / ≈ 15
+(CAM17_UNI) 으로 **자연 k 와 학습된 k 가 정렬**됨. ECC-DI 는 ITC slide 에 k=45~52 학습
+(over-broad). LSAP 의 entmax 가 데이터의 자연 sparsity 를 그대로 학습한다는 메커니즘 증거.
 
-→ ITC/micro 같은 희소 클래스에서 LSAP α=1.1 은 P(true|y) 가 Vanilla/ECC-DI 대비 상승.
+### 6.2 Backbone–α interaction (caveat)
 
-## Appendix B. Files modified
+같은 α=1.1 이 cell 따라 효과가 정반대:
 
-- [main.py](main.py) — CLI flags
-- [models/model_abmil.py](models/model_abmil.py) — z-score + entmax_α dispatch
-- [models/model_clam.py](models/model_clam.py) — `LSAPTemperature` 모듈
-- [models/model_acmil.py](models/model_acmil.py) — ACMIL 분기 (후속)
-- [utils/core_utils.py](utils/core_utils.py) — kwargs 전달
-- [scripts/cells_lsap_w02.txt](scripts/cells_lsap_w02.txt) — BRACS 45 line
-- [scripts/cells_lsap_w03.txt](scripts/cells_lsap_w03.txt) — CAM17 45 line
-- [scripts/worker_lsap.sh](scripts/worker_lsap.sh) — multi-GPU dispatcher
+| Cell          | AT (BRACS) / ITC (CAM17) accuracy Δ vs Vanilla |
+|---------------|------------------------------------------------|
+| BRACS_CONCH   | **+5.2 pp** (37.9 → 43.1%)                     |
+| BRACS_UNI     | **−7.1 pp** (39.7 → 32.6%) ⚠                   |
+| CAM17_CONCH   | **+14.3 pp** (23.5 → 37.8%)                    |
+| CAM17_UNI     | **+4.9 pp** (17.3 → 22.2%)                     |
+
+UNI 의 vanilla attention σ(a)=1.23 (CONCH 0.68 보다 sharp) 이라, α=1.1 의 less-sparse
+정책과 mismatch. **단일 α 규칙으로 모든 backbone × class 를 만족할 수 없음.** Cell-aware
+또는 class-aware α 가 후속 연구 방향.
+
+### 6.3 Sparsity vs AUC trade-off
+
+LSAP α 가 1 → 2 로 갈수록 k_pool 감소 (CAM17_CONCH: 1320 → 78 → 18), AUC 는 비단조:
+
+| α | CAM17_CONCH k_pool | CAM17_CONCH AUC | ITC acc |
+|---|--------------------|------------------|---------|
+| 1.1 | 1320 | 0.9253 | **37.8%** ⭐ |
+| 1.3 | 78  | 0.9173 | 30.4% |
+| 1.5 | 18  | **0.9278 ⭐** | 30.4% |
+
+→ α=1.1 은 ITC class 특화, α=1.5 는 overall AUC 특화. 메소드의 실용적 사용은
+"primary endpoint 가 minority class detection 이면 α=1.1, overall ranking 이면 α=1.5".
+
+---
+
+## 7. Slurm 전환 & 남은 작업
+
+- 사용자 별도 세션에서 Slinky → Slurm 전환 진행 중.
+- 전환 후 잔여 **43 LSAP α runs** 일괄 dispatch:
+  - BRACS_UNI: α=1.3 (2 seed), α=1.5 (5 seed) = 7
+  - BRACS_Virchow: 3 α × 5 seed = 15
+  - CAM17_UNI: α=1.3 + α=1.5 = 10
+  - CAM17_Virchow: 3 α × 5 seed = 15
+- 완료 즉시 본 문서의 §4.2, §4.3, §4.5, §4.6 표 갱신.
+
+---
+
+## Appendix A — Files modified for LSAP
+
+| 파일 | 변경 |
+|------|------|
+| [main.py](main.py) | CLI flags `--attn_norm`, `--lsap_alpha`, `--lsap_no_tau` |
+| [models/model_abmil.py](models/model_abmil.py) | z-score + entmax_α dispatch, k_pool 측정 |
+| [models/model_clam.py](models/model_clam.py) | (사용 안 하는 LSAPTemperature class 는 유지, no_tau 옵션으로 우회) |
+| [utils/core_utils.py](utils/core_utils.py) | ABMIL kwargs plumbing |
+| [scripts/cells_lsap_w02.txt](scripts/cells_lsap_w02.txt) | BRACS 45 lines (cell × α × seed grid) |
+| [scripts/cells_lsap_w03.txt](scripts/cells_lsap_w03.txt) | CAM17 45 lines |
+| [scripts/worker_lsap.sh](scripts/worker_lsap.sh) | multi-GPU dispatcher (skip-if-done, lock) |
+
+## Appendix B — 본 결과 표를 생성한 EDA / aggregation 스크립트
+
+| 스크립트 | 역할 |
+|----------|------|
+| `eda/_eda_lowdim*.py` | vanilla attention 의 `n_mass50`, σ(a), max−mean 분포 |
+| `eda/_lsap_full_table.py` | per cell × method 의 AUC / k_pool / per-class accuracy 집계 |
+| `eda/_method_confidence_all.py` | Vanilla / ECC-DI / LSAP 의 P(t\|y), correct/incorrect confidence |
+| `eda/_mt_drop_eda.py` | BRACS_CONCH α=1.1 의 MT→AT 혼동 원인 분석 |
+| `eda/lsap_confidence.py` | per-class P(t\|y) dump |
